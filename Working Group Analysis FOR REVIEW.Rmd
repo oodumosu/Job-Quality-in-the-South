@@ -1,0 +1,381 @@
+---
+title: "Working Group Analysis V4: Cleaned for code review"
+author: "Kemi Odumosu"
+date: "1/14/26"
+output: html_document
+---
+
+# Setup
+```{r, include=FALSE, warning=FALSE}
+
+library('spatstat')
+library(tidyverse)
+library(tigris)
+library(openxlsx)
+
+```
+
+```{r, warning=FALSE, include=FALSE}
+
+# Import data
+
+# NOTE: To load data, you must download both the extract's data and the DDI
+# and also set the working directory to the folder with these files (or change the path below).
+
+if (!require("ipumsr")) stop("Reading IPUMS data into R requires the ipumsr package. It can be installed using the following command: install.packages('ipumsr')")
+
+ddi <- read_ipums_ddi("cps_00025.xml") # Contains samples for 2019-2024
+data <- read_ipums_micro(ddi)
+df <-  data.frame(data) %>% 
+  select(-c(SERIAL, MONTH, REGION, CPSID, ASECFLAG, PERNUM, CPSIDP, CPSIDV, METFIPS, ASECWTH, SEX, RACE, HISPAN, CITIZEN, EDUC, OCC10LY, CLASSWLY, PENSION, NUMEMPS, FTOTVAL, INCUNEMP, INCWKCOM, SRCUNEMP, SRCWKCOM, MIGSTA1, WHYMOVE, HEALTH, PAIDGH, CAIDLY, HIELIG, HINTAKE3, KIDCNEED, UNION))
+
+```
+
+# Cleaning
+
+## Recode values 
+```{r, warning=FALSE}
+# Replace values with labels where applicable
+  ## Note: Does not work on COUNTY, just converts data type to character
+vars_to_convert <- c(
+  "STATEFIP", "COUNTY",
+  "LABFORCE", "WKSWORK1", "UHRSWORKLY", "INCWAGE",
+  "HIMCAIDLY", "ANYCOVLY", "GRPCOVLY"
+)
+
+df[vars_to_convert] <- lapply(df[vars_to_convert], function(x) {
+  as.character(haven::as_factor(x))
+})
+
+
+# Convert to numeric
+df <- df %>%
+  mutate(
+    # Clean and convert UHRSWORKLY
+    UHRSWORKLY = ifelse(UHRSWORKLY == "NIU (Not in universe)", NA_character_, UHRSWORKLY),
+    UHRSWORKLY = ifelse(UHRSWORKLY == "99 hours or more", "99", UHRSWORKLY),
+    UHRSWORKLY = as.integer(UHRSWORKLY),
+
+    # Clean and convert income fields
+    INCWAGE = ifelse(INCWAGE == "N.I.U. (Not in Universe)", NA_character_, INCWAGE),
+    INCWAGE = as.double(INCWAGE),
+
+    # Convert other fields directly
+    WKSWORK1 = as.integer(WKSWORK1)
+  )
+
+
+# Adjust for inflation
+CPI <- read.csv("SeriesReport-20250919121805_45263d.csv") %>% select(Year, Annual)
+## Pull CPI for 2024
+curr_CPI <- CPI %>% filter(Year == 2024) %>% pull(Annual)
+## Adjust wages to 2024 dollars
+df <- right_join(CPI, df, by = c("Year" = "YEAR")) %>% mutate(INCWAGE = (curr_CPI/Annual) * INCWAGE)
+
+
+# Calculate hourly wage 
+df$HOURLY <- round(df$INCWAGE / (df$UHRSWORKLY * df$WKSWORK1), 2)
+
+
+```
+
+## Geographic variables
+```{r}
+
+# State
+df$STATE <- state.abb[match(df$STATEFIP, state.name)]
+df <- select(df, -STATEFIP)
+
+# County
+  # Get county shapefile as a data frame, tigris::counties()
+county_df <- counties(cb = TRUE, year = 2024, class = "data.frame") %>%
+  select(COUNTY = GEOID, COUNTY_NAME = NAME)
+
+  # Make sure df$COUNTY is character and zero-padded to 5 digits
+df <- df %>%
+  mutate(COUNTY = sprintf("%05d", as.integer(COUNTY))) %>%
+  left_join(county_df, by = "COUNTY") %>%
+  select(-c(geometry))
+df <- df %>% rename(COUNTY_FIP = COUNTY, 
+                    COUNTY = COUNTY_NAME)
+
+```
+## Add rent-burned variable
+```{r}
+
+# Rent-burdened: workers who would need to spend more than 30% of their income on rental housing, based on HUD's median 2bd rent price by county for 2025, https://www.huduser.gov/portal/datasets/50per.html
+
+rent <- read.csv("FY2025_FMR_50_county.csv") %>% #4764 obs
+  mutate(county_code = sprintf("%03d", as.integer(county_code)),
+         COUNTY_FIP = paste0(state_code, county_code),
+         COUNTY = sub(" County$", "", cntyname,),
+         median_monthly_2bd_rent = rent_50_2 * 12,
+         median_annual_2bd_rent = rent_50_2 * 12) %>%
+    select(COUNTY_FIP, COUNTY, state_alpha, median_monthly_2bd_rent, median_annual_2bd_rent) %>%
+  group_by(COUNTY_FIP, COUNTY, state_alpha) %>%
+  slice(1) %>%
+  ungroup()  # 3228 obs
+
+# Create an indicator for rent burdened
+df <- rent %>% 
+  right_join(df, by = "COUNTY_FIP") %>% 
+  mutate(rent_burdened = ifelse(median_annual_2bd_rent > (0.3 * INCWAGE), 1, 0)) %>%
+  rename(COUNTY = COUNTY.x) %>%
+  select(-c(COUNTY.y, state_alpha))
+  
+
+```
+
+## Industry Group labels
+```{r}
+
+# Add granular IND90LY labels to a new variable 
+  ## https://cps.ipums.org/cps-action/variables/IND1990
+
+df$IND <- as.character(haven::as_factor(df$IND90LY))
+df$IND <- ifelse(df$IND %in% c("NIU", "Not in universe"), NA_character_, df$IND)
+df <- df %>% mutate(IND90LY = as.integer(IND90LY))
+
+# Replace industry codes with grouped labels
+df <- df %>%
+  mutate(IND_GROUP = case_when(
+    IND90LY == 0 ~ "NA",
+    between(IND90LY, 10, 32) ~ "Agriculture, Forestry, and Fisheries",
+    between(IND90LY, 40, 50) ~ "Mining",
+    IND90LY == 60 ~ "Construction", # *
+    between(IND90LY, 100, 392) ~ "Manufacturing", # *
+    IND90LY == 471 ~ "Sanitary Services*",
+    between(IND90LY, 400, 442) ~ "Transportation and Communications",
+    between(IND90LY, 450, 472) ~ "Utilities and sanitary services", # *
+    between(IND90LY, 500, 571) ~ "Wholesale Trade",
+    between(IND90LY, 580, 691) ~ "Retail Trade",
+    between(IND90LY, 700, 712) ~ "Finance, Insurance, and Real Estate",
+    between(IND90LY, 721, 760) ~ "Business and Repair Services",
+    between(IND90LY, 761, 791) ~ "Personal Services",
+    between(IND90LY, 800, 810) ~ "Entertainment and Recreation Services",
+    between(IND90LY, 812, 893) ~ "Professional and Related Services",
+    between(IND90LY, 900, 932) ~ "Public Administration",
+    between(IND90LY, 940, 960) ~ "Active Duty Military",
+    IND90LY == 992 ~ "Last Worked 1984 or earlier",
+    IND90LY == 999 ~ "Unknown",
+    TRUE ~ "NA"
+  )) %>% select(-IND90LY)
+
+
+```
+
+
+# Define the dataset
+## Filter the dataset to people (all ages) in the labor force
+```{r}
+
+df <- df %>%
+  filter(Year >= 2021) %>% # Effectively covers 2020-2023, 606,673 obs
+  # Currently in labor force, https://cps.ipums.org/cps-action/variables/LABFORCE#codes_section
+    filter(LABFORCE == "Yes, in the labor force") %>%  # Removes over half of the sample: 294,288 obs remaining
+  select(-LABFORCE)
+
+```
+
+# Analysis of CPS data
+## Function to calculate county (and industry) -level metrics
+``` {r}
+
+# Calculate worker metrics by industry group and geography (county)
+calculate_metrics <- function(county_name, state_abb, industry_group){
+  
+  geo_df <- df
+  
+  # Limit df observations to state if "All" is not input
+  if (state_abb != "All") {
+    geo_df <- filter(geo_df, STATE %in% state_abb)
+  }
+  
+  # Limit df observations to county if "All" is not input
+  if (county_name != "All") {
+    geo_df <- filter(geo_df, COUNTY %in% county_name)
+  }
+
+  # Limit df observations to industry "All" is not input
+  if (industry_group != "All") {
+    geo_df <- filter(geo_df, IND_GROUP == industry_group)
+  }
+  
+  # Calculate local worker metrics
+  geo_df <- geo_df %>%
+    
+    ## Number of workers
+  summarise(total_workers = sum(ASECWT, na.rm = TRUE),
+  
+    ## Median wage
+  median_wage = weighted.median(HOURLY, w = ASECWT, na.rm = TRUE),
+
+    ## Share of rent burdened workers: 2bd rent > 30% income
+  rent_burden = round(sum(ifelse(rent_burdened == 1, ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
+  
+    ## Share of workers who are not covered by health insurance from their employer
+  no_employer_insurance = round((total_workers - sum(ifelse(GRPCOVLY == "Yes", ASECWT, 0), na.rm = TRUE)) / total_workers * 100, 2),
+  
+    ## Share of workers have no health insurance coverage 
+  no_health_insurance = round((total_workers - sum(ifelse(ANYCOVLY == "Yes", ASECWT, 0), na.rm = TRUE)) / total_workers * 100, 2),
+  
+    ## Share of workers who are covered by Medicaid
+  medicaid = round(sum(ifelse(HIMCAIDLY == "Yes", ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
+
+    ## Share of workers earning less than the living wage for single childless household in Hillsborough/Orange County, FL (using monthly county-level EPI estimates as threshold: https://www.epi.org/resources/budget/budget-factsheets)
+  
+  no_single_living_wage_hc = round(sum(ifelse(INCWAGE < (4589*12), ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
+  no_single_living_wage_oc = round(sum(ifelse(INCWAGE < (4849*12), ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2)) %>% select(-c("total_workers"))
+  
+  # If this is being run for a specific industry, remove un-necessary statistics from table
+  if (industry_group != "All") {
+  geo_df <- select(geo_df, -c("rent_burden", "no_single_living_wage_hc", "no_single_living_wage_oc"))
+  }
+  
+  if (industry_group == "Manufacturing") {
+geo_df <- select(geo_df, c("median_wage"))
+  }
+  
+  # Make the table longer/easier to read and save as function output
+  geo_df %>% 
+    pivot_longer(everything(), names_to = "metric", values_to = industry_group) %>%
+    return()
+}
+
+
+```
+
+
+## Stats to check: % rent burdened (76%), % workers not earning a living wage for a single resident without kids (57%), construction median wage ($19.77), manufacturing median wage ($26.10), % workers without employer health insurance (35%), % construction workers without employer health insurance (58%), % workers without any health coverage (12%), % construction workers without any health coverage (31%), % workers with Medicaid insurance (5%), % construction workers with Medicaid insurance (10%)
+```{r}
+
+# Hillborough County, FL
+calculate_metrics("Hillsborough", "FL", "All")
+calculate_metrics("Hillsborough", "FL", "Construction") 
+calculate_metrics("Hillsborough", "FL", "Manufacturing")
+
+```
+
+## Stats to check: % rent burdened (82%), % workers not earning a living wage for a single resident without kids (65%), construction median wage ($20.67), manufacturing median wage ($27.72), % workers without employer health insurance (39%), % construction workers without employer health insurance (57%), % workers without any health coverage (13%), % construction workers without any health coverage (28%), % workers with Medicaid insurance (6%), % construction workers with Medicaid insurance (5%)
+```{r}
+
+# Orange County, FL
+calculate_metrics("Orange", "FL", "All")
+calculate_metrics("Orange", "FL", "Construction")
+calculate_metrics("Orange", "FL", "Manufacturing")
+
+```
+
+# Analysis of non-CPS data
+## Stat to check: % FL workers in union elections that voted in support of unionization (49%)
+```{r}
+
+# Read and clean union election data
+union_elections <- read.csv("all_elections_1.19_12.24.csv") %>%
+  rename(STATE = Dispute.Unit.State,
+         CITY = Dispute.Unit.City) %>%
+  mutate(Valid.Votes.For = ifelse(!is.na(Votes.for.Labor.Org.1), Votes.for.Labor.Org.1, 0) + ifelse(!is.na(Votes.for.Labor.Org.2), Votes.for.Labor.Org.2, 0) + ifelse(!is.na(Votes.For.Labor.Org3), Votes.For.Labor.Org3, 0),
+         Year = str_extract(Election.Held.Date, "\\d{4}$")) %>%
+  filter(Year >= 2020) %>% # Covers 2020-2024
+  select(Year, STATE, CITY, Num.Eligible.Voters, Valid.Votes.Against, Valid.Votes.For)
+
+# Calculate union support by state and pull stats for Florida
+union_elections %>%
+  group_by(STATE) %>%
+  summarise(total_eligible_voters = sum(Num.Eligible.Voters, na.rm = TRUE),
+            total_votes_for = sum(Valid.Votes.For, na.rm = TRUE),
+         share_support = total_votes_for/total_eligible_voters) %>%
+  filter(STATE == "FL")
+
+```
+## Stat to check: Florida ranking among states with highest number of workplace injuries (2nd)
+```{r}
+
+# Load in OSHA Injury Tracking Application data, https://www.osha.gov/Establishment-Specific-Injury-and-Illness-Data
+
+ita <- read.csv("ITA 300A Summary Data 2024 through 04-30-2025.csv")
+
+# Calculate the number of workplace injuries by state and rank
+ita %>%
+  filter(state %in% unique(df$STATE)) %>%
+  filter(sector == "Construction") %>%
+  group_by(state) %>%
+  summarise(total_workers = sum(annual_average_employees, na.rm = TRUE),
+            tot_injuries = sum(total_injuries, na.rm = TRUE),
+            injury_per_worker = tot_injuries/total_workers) %>%
+  arrange(desc(tot_injuries))
+
+```
+
+# Stats to check: # workplace injuries + deaths (6,514), # construction injuries + deaths (583), # of work days lost in construction (6,433)
+```{r}
+# Hillsborough County zip codes (for ITA crosswalk) https://www.unitedstateszipcodes.org/
+
+hc_zips <- c(
+  "33572","33503","33510","33511","33527","33530","33534","33810","33547","33548",
+  "33549","33558","33559","33550","33860","33556","33563","33565","33566","33567",
+  "33569","33578","33579","33570","33584","33573","33602","33603","33604","33605",
+  "33606","33607","33609","33610","33611","33612","33613","33614","33615","33616",
+  "33617","33618","33619","33621","33624","33625","33626","33629","33634","33635",
+  "33637","33647","33620","33592","33594","33596","33598","33540") 
+
+hillsborough_county_injuries <- ita %>%
+  filter(state == "FL") %>%
+  filter(zip_code %in% hc_zips) %>%
+  summarise(num_injuries = sum(total_injuries, na.rm = TRUE),
+            num_deaths = sum(total_deaths, na.rm = TRUE),
+            num_injuries_deaths = num_injuries + num_deaths) %>%
+  select(num_injuries_deaths)
+
+hillsborough_county_construction_injuries <- ita %>%
+  filter(state == "FL") %>%
+  filter(zip_code %in% hc_zips) %>%
+  filter(sector == "Construction") %>%
+  summarise(num_injuries = sum(total_injuries, na.rm = TRUE),
+            num_deaths = sum(total_deaths, na.rm = TRUE),
+            num_injuries_deaths = num_injuries + num_deaths,
+            work_days_lost = sum(total_dafw_days, na.rm = TRUE)) %>%
+  select(c(num_injuries_deaths, work_days_lost))
+
+hillsborough_county_injuries
+hillsborough_county_construction_injuries
+
+```
+
+# Stats to check: # injuries + deaths (12,527), # construction injuries + deaths (470), # of work days lost in construction (4,324)
+```{r}
+
+# Orange County, FL zip codes (for ITA crosswalk) https://www.unitedstateszipcodes.org/
+
+oc_zips <- c(
+  "32703","32712","32709","34734","34747","32751","32757","34760","34761","32801",
+  "32803","32804","32805","32806","32807","32808","32809","32810","32811","32812",
+  "32814","32817","32818","32819","32820","32821","32822","32824","32825","32826",
+  "32827","32828","32829","32831","32832","32833","32835","32836","32837","32839",
+  "32816","32830","32768","32776","34786","34787","32789","32792","32798")
+
+
+orange_county_injuries <- ita %>%
+  filter(state == "FL") %>%
+  filter(zip_code %in% oc_zips) %>%
+  summarise(num_injuries = sum(total_injuries, na.rm = TRUE),
+            num_deaths = sum(total_deaths, na.rm = TRUE),
+            num_injuries_deaths = num_injuries + num_deaths,
+            work_days_lost = sum(total_dafw_days, na.rm = TRUE))  %>%
+  select(num_injuries_deaths)
+
+orange_county_construction_injuries <- ita %>%
+  filter(state == "FL") %>%
+  filter(zip_code %in% oc_zips) %>%
+  filter(sector == "Construction") %>%
+  summarise(num_injuries = sum(total_injuries, na.rm = TRUE),
+            num_deaths = sum(total_deaths, na.rm = TRUE),
+            num_injuries_deaths = num_injuries + num_deaths,
+            work_days_lost = sum(total_dafw_days, na.rm = TRUE))  %>%
+  select(c(num_injuries_deaths, work_days_lost))
+
+
+orange_county_injuries
+orange_county_construction_injuries
+
+```
