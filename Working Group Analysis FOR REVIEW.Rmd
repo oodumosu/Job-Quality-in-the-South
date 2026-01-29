@@ -51,12 +51,12 @@ df[vars_to_convert] <- lapply(df[vars_to_convert], function(x) {
 df <- df %>%
   mutate(
     # Clean and convert UHRSWORKLY
-    UHRSWORKLY = ifelse(UHRSWORKLY == "NIU (Not in universe)", NA_character_, UHRSWORKLY),
-    UHRSWORKLY = ifelse(UHRSWORKLY == "99 hours or more", "99", UHRSWORKLY),
+    UHRSWORKLY = if_else(UHRSWORKLY == "NIU (Not in universe)", NA_character_, UHRSWORKLY),
+    UHRSWORKLY = if_else(UHRSWORKLY == "99 hours or more", "99", UHRSWORKLY),
     UHRSWORKLY = as.integer(UHRSWORKLY),
 
     # Clean and convert income fields
-    INCWAGE = ifelse(INCWAGE == "N.I.U. (Not in Universe)", NA_character_, INCWAGE),
+    INCWAGE = if_else(INCWAGE == "N.I.U. (Not in Universe)", NA_character_, INCWAGE),
     INCWAGE = as.double(INCWAGE),
 
     # Convert other fields directly
@@ -118,7 +118,7 @@ rent <- read_csv("FY2025_FMR_50_county.csv") %>% #4764 obs
 # Create an indicator for rent burdened
 df <- rent %>% 
   right_join(df, by = "COUNTY_FIP") %>% 
-  mutate(rent_burdened = ifelse(median_annual_2bd_rent > (0.3 * INCWAGE), 1, 0)) %>%
+  mutate(rent_burdened = if_else(median_annual_2bd_rent > (0.3 * INCWAGE), 1, 0)) %>%
   rename(COUNTY = COUNTY.x) %>%
   select(-c(COUNTY.y, state_alpha))
   
@@ -132,7 +132,7 @@ df <- rent %>%
   ## https://cps.ipums.org/cps-action/variables/IND1990
 
 df$IND <- as.character(haven::as_factor(df$IND90LY))
-df$IND <- ifelse(df$IND %in% c("NIU", "Not in universe"), NA_character_, df$IND)
+df$IND <- if_else(df$IND %in% c("NIU", "Not in universe"), NA_character_, df$IND)
 df <- df %>% mutate(IND90LY = as.integer(IND90LY))
 
 # Replace industry codes with grouped labels
@@ -210,21 +210,21 @@ calculate_metrics <- function(county_name, state_abb, industry_group){
   median_wage = weighted.median(HOURLY, w = ASECWT, na.rm = TRUE),
 
     ## Share of rent burdened workers: 2bd rent > 30% income
-  rent_burden = round(sum(ifelse(rent_burdened == 1, ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
+  rent_burden = round(sum(if_else(rent_burdened == 1, ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
   
     ## Share of workers who are not covered by health insurance from their employer
-  no_employer_insurance = round((total_workers - sum(ifelse(GRPCOVLY == "Yes", ASECWT, 0), na.rm = TRUE)) / total_workers * 100, 2),
+  no_employer_insurance = round((total_workers - sum(if_else(GRPCOVLY == "Yes", ASECWT, 0), na.rm = TRUE)) / total_workers * 100, 2),
   
     ## Share of workers have no health insurance coverage 
-  no_health_insurance = round((total_workers - sum(ifelse(ANYCOVLY == "Yes", ASECWT, 0), na.rm = TRUE)) / total_workers * 100, 2),
+  no_health_insurance = round((total_workers - sum(if_else(ANYCOVLY == "Yes", ASECWT, 0), na.rm = TRUE)) / total_workers * 100, 2),
   
     ## Share of workers who are covered by Medicaid
-  medicaid = round(sum(ifelse(HIMCAIDLY == "Yes", ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
+  medicaid = round(sum(if_else(HIMCAIDLY == "Yes", ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
 
     ## Share of workers earning less than the living wage for single childless household in Hillsborough/Orange County, FL (using monthly county-level EPI estimates as threshold: https://www.epi.org/resources/budget/budget-factsheets)
   
-  no_single_living_wage_hc = round(sum(ifelse(INCWAGE < (4589*12), ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
-  no_single_living_wage_oc = round(sum(ifelse(INCWAGE < (4849*12), ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2)) %>% select(-c("total_workers"))
+  no_single_living_wage_hc = round(sum(if_else(INCWAGE < (4589*12), ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2),
+  no_single_living_wage_oc = round(sum(if_else(INCWAGE < (4849*12), ASECWT, 0), na.rm = TRUE) / total_workers * 100, 2)) %>% select(-c("total_workers"))
   
   # If this is being run for a specific industry, remove un-necessary statistics from table
   if (industry_group != "All") {
@@ -273,7 +273,7 @@ calculate_metrics("Orange", "FL", "Manufacturing")
 union_elections <- read_csv("all_elections_1.19_12.24.csv") %>%
   rename(STATE = Dispute.Unit.State,
          CITY = Dispute.Unit.City) %>%
-  mutate(Valid.Votes.For = ifelse(!is.na(Votes.for.Labor.Org.1), Votes.for.Labor.Org.1, 0) + ifelse(!is.na(Votes.for.Labor.Org.2), Votes.for.Labor.Org.2, 0) + ifelse(!is.na(Votes.For.Labor.Org3), Votes.For.Labor.Org3, 0),
+  mutate(Valid.Votes.For = if_else(!is.na(Votes.for.Labor.Org.1), Votes.for.Labor.Org.1, 0) + if_else(!is.na(Votes.for.Labor.Org.2), Votes.for.Labor.Org.2, 0) + if_else(!is.na(Votes.For.Labor.Org3), Votes.For.Labor.Org3, 0),
          Year = str_extract(Election.Held.Date, "\\d{4}$")) %>%
   filter(Year >= 2020) %>% # Covers 2020-2024
   select(Year, STATE, CITY, Num.Eligible.Voters, Valid.Votes.Against, Valid.Votes.For)
