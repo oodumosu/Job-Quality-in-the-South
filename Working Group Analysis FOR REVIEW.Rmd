@@ -65,7 +65,7 @@ df <- df %>%
 
 
 # Adjust for inflation
-CPI <- read.csv("SeriesReport-20250919121805_45263d.csv") %>% select(Year, Annual)
+CPI <- read_csv("SeriesReport-20250919121805_45263d.csv") %>% select(Year, Annual)
 ## Pull CPI for 2024
 curr_CPI <- CPI %>% filter(Year == 2024) %>% pull(Annual)
 ## Adjust wages to 2024 dollars
@@ -104,7 +104,7 @@ df <- df %>% rename(COUNTY_FIP = COUNTY,
 
 # Rent-burdened: workers who would need to spend more than 30% of their income on rental housing, based on HUD's median 2bd rent price by county for 2025, https://www.huduser.gov/portal/datasets/50per.html
 
-rent <- read.csv("FY2025_FMR_50_county.csv") %>% #4764 obs
+rent <- read_csv("FY2025_FMR_50_county.csv") %>% #4764 obs
   mutate(county_code = sprintf("%03d", as.integer(county_code)),
          COUNTY_FIP = paste0(state_code, county_code),
          COUNTY = sub(" County$", "", cntyname,),
@@ -270,7 +270,7 @@ calculate_metrics("Orange", "FL", "Manufacturing")
 ```{r}
 
 # Read and clean union election data
-union_elections <- read.csv("all_elections_1.19_12.24.csv") %>%
+union_elections <- read_csv("all_elections_1.19_12.24.csv") %>%
   rename(STATE = Dispute.Unit.State,
          CITY = Dispute.Unit.City) %>%
   mutate(Valid.Votes.For = ifelse(!is.na(Votes.for.Labor.Org.1), Votes.for.Labor.Org.1, 0) + ifelse(!is.na(Votes.for.Labor.Org.2), Votes.for.Labor.Org.2, 0) + ifelse(!is.na(Votes.For.Labor.Org3), Votes.For.Labor.Org3, 0),
@@ -292,7 +292,7 @@ union_elections %>%
 
 # Load in OSHA Injury Tracking Application data, https://www.osha.gov/Establishment-Specific-Injury-and-Illness-Data
 
-ita <- read.csv("ITA 300A Summary Data 2024 through 04-30-2025.csv")
+ita <- read_csv("ITA 300A Summary Data 2024 through 04-30-2025.csv")
 
 # Calculate the number of workplace injuries by state and rank
 ita %>%
