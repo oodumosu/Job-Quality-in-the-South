@@ -8,7 +8,6 @@ output: html_document
 # Setup
 ```{r, include=FALSE, warning=FALSE}
 
-library('spatstat')
 library(tidyverse)
 library(tigris)
 library(openxlsx)
